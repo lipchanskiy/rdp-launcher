@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "rdp-launcher",
+  "name": "RDP Launcher",
+  "version": "1.0.0",
+  "author": "Alexey Lipchanskiy",
+  "description": "Saved RDP connections to Windows machines, launched with FreeRDP in a resizable window",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "RDP Launcher",
+    "description": "Saved RDP connections to Windows machines",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

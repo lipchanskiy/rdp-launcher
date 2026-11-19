@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# Helper for the rdp-launcher shell plugin for Omarchy.
+#
+#   rdp-launcher connect <id> [--password-stdin]   start an RDP session (detached)
+#   rdp-launcher store <id> <label>                save the password read from stdin to the keyring
+#   rdp-launcher forget <id>                       remove the saved password
+#   rdp-launcher has <id>                          exit 0 if a password is saved
+#   rdp-launcher saved                             print the ids that have a saved password
+#
+# Profiles live in ~/.config/rdp-launcher/connections.json (no secrets there).
+# Passwords live in the Secret Service keyring (gnome-keyring) under
+# service=rdp-launcher id=<id>. They are never put on a command line: the
+# whole FreeRDP argument list goes to the client over stdin (/args-from:stdin).
+
+set -uo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/rdp-launcher/connections.json"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rdp-launcher"
+SERVICE="rdp-launcher"
+
+die() { echo "$*" >&2; exit 1; }
+
+valid_id() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "invalid id"; }
+
+notify() {
+  notify-send -a "RDP Launcher" -i network-workgroup "$1" "${2:-}" 2>/dev/null || true
+}
+
+pick_client() {
+  if [[ -n ${RDP_LAUNCHER_CLIENT:-} ]] && command -v "$RDP_LAUNCHER_CLIENT" >/dev/null; then
+    echo "$RDP_LAUNCHER_CLIENT"
+  elif command -v xfreerdp3 >/dev/null; then
+    # Through XWayland with force_zero_scaling: real pixels, so the image is
+    # sharp and fullscreen covers the whole screen. sdl-freerdp3 mixes up
+    # logical and physical pixels on a scaled (HiDPI) monitor: blown-up
+    # dialogs and a fullscreen picture squeezed into a quarter of the screen.
+    echo xfreerdp3
+  elif command -v sdl-freerdp3 >/dev/null; then
+    echo sdl-freerdp3
+  elif command -v xfreerdp >/dev/null; then
+    echo xfreerdp
+  else
+    die "FreeRDP is not installed"
+  fi
+}
+
+# Work area of the focused monitor in physical pixels (minus the bar), so the
+# window starts at the size Hyprland will maximize it to and Windows does not
+# have to resize the desktop right after logon.
+work_area() {
+  hyprctl monitors -j 2>/dev/null | jq -r '
+    (map(select(.focused))[0] // .[0]) as $m
+    | ($m.reserved // [0,0,0,0]) as $r
+    | "\($m.width - (($r[0] + $r[2]) * $m.scale | floor))x\($m.height - (($r[1] + $r[3]) * $m.scale | floor))"
+  ' 2>/dev/null
+}
+
+PLUGIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Raw scale of the focused monitor ("2", "1.5", ...).
+monitor_scale_raw() {
+  hyprctl monitors -j 2>/dev/null | jq -r '(map(select(.focused))[0] // .[0]).scale // 1' 2>/dev/null || echo 1
+}
+
+# Path to the cursor shim (see src/cursor-shim.c), built on first use.
+cursor_shim() {
+  local so="$PLUGIN_DIR/bin/cursor-shim.so" src="$PLUGIN_DIR/src/cursor-shim.c"
+  if [[ ! -f $so || $src -nt $so ]] && command -v gcc >/dev/null; then
+    gcc -O2 -shared -fPIC -o "$so" "$src" -ldl -lXcursor -lm 2>/dev/null || return 1
+  fi
+  [[ -f $so ]] && echo "$so"
+}
+
+# Scale of the focused monitor, as a percentage for /scale-desktop.
+monitor_scale() {
+  local s
+  s=$(hyprctl monitors -j 2>/dev/null | jq -r 'map(select(.focused)) | (.[0].scale // 1)' 2>/dev/null)
+  awk -v s="${s:-1}" 'BEGIN { p = int(s * 100 + 0.5); if (p < 100) p = 100; if (p > 500) p = 500; print p }'
+}
+
+# Maximize the session window (over the work area, bar stays visible) as soon
+# as Hyprland maps it, so the plugin needs no window rule in the user's
+# hyprland.lua. Matched by pid: only this session's window, never another one.
+# Gives up after 90 s (a slow logon) or when the client has exited.
+maximize_when_mapped() {
+  local pid=$1 addr i
+  command -v hyprctl >/dev/null || return 0
+  for (( i = 0; i < 360; i++ )); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    addr=$(hyprctl clients -j 2>/dev/null | jq -r --argjson p "$pid" \
+      'map(select(.pid == $p and .mapped != false))[0].address // empty' 2>/dev/null)
+    if [[ $addr =~ ^0x[0-9a-f]+$ ]]; then
+      hyprctl dispatch "hl.dsp.window.fullscreen({ mode = \"maximized\", action = \"set\", window = \"address:$addr\" })" >/dev/null 2>&1
+      return 0
+    fi
+    sleep 0.25
+  done
+}
+
+# A short, human explanation of why a session failed, from its log.
+explain_failure() {
+  local log=$1 rc=$2
+  if grep -qE 'ERRCONNECT_(LOGON_FAILURE|AUTHENTICATION_FAILED)|STATUS_LOGON_FAILURE' "$log"; then
+    echo "Неверное имя пользователя или пароль."
+  elif grep -qE 'ERRCONNECT_(PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|PASSWORD_CERTAINLY_EXPIRED)' "$log"; then
+    echo "Срок действия пароля истёк — смените его в Windows."
+  elif grep -qE 'ERRCONNECT_ACCOUNT_(DISABLED|LOCKED_OUT|RESTRICTION|EXPIRED)' "$log"; then
+    echo "Учётная запись заблокирована или ей запрещён вход."
+  elif grep -qE 'ERRCONNECT_DNS_NAME_NOT_FOUND|Name or service not known|getaddrinfo.*(-2|-3)' "$log"; then
+    echo "Компьютер с таким именем не найден."
+  elif grep -qE 'failed with error: .*\[111\]|Connection refused' "$log"; then
+    echo "Компьютер отклонил соединение: RDP выключен или закрыт порт."
+  elif grep -qE 'ERRCONNECT_CONNECT_TRANSPORT_FAILED|failed with error: .*\[(110|113|101)\]|timed out|ETIMEDOUT|No route to host' "$log"; then
+    echo "Компьютер не отвечает. Проверьте адрес и сеть (VPN?)."
+  elif grep -qE 'certificate|ERRCONNECT_TLS' "$log"; then
+    echo "Проблема с сертификатом. Попробуйте «Без проверки TLS» в настройках подключения."
+  elif grep -qE 'ERRCONNECT_SECURITY_NEGO|NLA|CredSSP' "$log"; then
+    echo "Сервер отклонил согласование безопасности (NLA). Проверьте домен и имя пользователя."
+  else
+    local last
+    last=$(grep -E '\[(ERROR|FATAL)\]' "$log" | grep -v TODO | head -n 1 | sed -E 's/^.*\]: //' | cut -c1-160)
+    echo "${last:-Код выхода $rc.} Журнал: $log"
+  fi
+}
+
+cmd_connect() {
+  local id=${1:-}; shift || true
+  valid_id "$id"
+  local password_stdin=0
+  [[ ${1:-} == --password-stdin ]] && password_stdin=1
+
+  [[ -r $CONFIG ]] || die "no saved connections"
+
+  # One field per line; any field holding a line break is refused so it
+  # cannot smuggle extra arguments into the stdin argument list.
+  local fields
+  fields=$(jq -r --arg id "$id" '
+    [.[] | select(.id == $id)][0] // error("connection not found")
+    | [ (.name // ""), (.host // ""), ((.port // 3389) | tostring),
+        (.username // ""), (.domain // ""),
+        # The // operator treats false as missing, so booleans are compared.
+        ((.savePassword != false) | tostring), ((.fullscreen == true) | tostring),
+        ((.clipboard != false) | tostring), ((.sound != false) | tostring),
+        ((.homeDrive == true) | tostring), ((.ignoreCert == true) | tostring),
+        ((.scale // "auto") | tostring), ((.unicodeKeyboard != false) | tostring) ]
+    | if any(.[]; test("[\r\n]")) then error("line break in a field") else .[] end
+  ' "$CONFIG" 2>&1) || die "${fields:-bad connection}"
+
+  local -a f
+  mapfile -t f <<<"$fields"
+  local name=${f[0]} host=${f[1]} port=${f[2]} user=${f[3]} domain=${f[4]}
+  local save=${f[5]} full=${f[6]} clip=${f[7]} sound=${f[8]} home=${f[9]} igncert=${f[10]} scale=${f[11]} unikbd=${f[12]}
+
+  [[ -n $host ]] || die "host is empty"
+  [[ $port =~ ^[0-9]{1,5}$ ]] || port=3389
+
+  local password=""
+  if (( password_stdin )); then
+    IFS= read -r password || true
+  elif [[ $save == true ]]; then
+    password=$(secret-tool lookup service "$SERVICE" id "$id" 2>/dev/null) || password=""
+  fi
+
+  if [[ $scale == auto ]]; then
+    scale=$(monitor_scale)
+  elif ! [[ $scale =~ ^[0-9]{3}$ ]]; then
+    scale=100
+  fi
+
+  local client; client=$(pick_client) || exit 1
+
+  # xfreerdp runs under XWayland, where Hyprland scales X cursors by the
+  # monitor scale on top of the DPI scaling Windows already applied: shrink
+  # the remote pointer back by that scale. RDP_LAUNCHER_CURSOR_FIX=0 disables.
+  local -a env_prefix=(env)
+  if [[ $client == xfreerdp* && ${RDP_LAUNCHER_CURSOR_FIX:-1} != 0 ]]; then
+    local mscale shim
+    mscale=$(monitor_scale_raw)
+    if awk -v s="$mscale" 'BEGIN { exit !(s > 1.01) }' && shim=$(cursor_shim); then
+      env_prefix+=("LD_PRELOAD=$shim${LD_PRELOAD:+:$LD_PRELOAD}" "RDP_LAUNCHER_CURSOR_SCALE=$mscale")
+    fi
+  fi
+
+  local -a args=(
+    "/v:$host"
+    "/port:$port"
+    "/t:${name:-$host}"
+    "/wm-class:rdp-launcher"
+    "+dynamic-resolution"
+    # Hyprland keeps its shortcuts (Super+F, Super+W, workspaces) while the
+    # session has focus; every other key still goes to Windows.
+    "-grab-keyboard"
+    # In fullscreen a hidden bar at the top edge offers minimize / window / close.
+    "/floatbar:sticky:off,default:hidden,show:fullscreen"
+    "+auto-reconnect"
+    "/auto-reconnect-max-retries:5"
+    "/scale-desktop:$scale"
+    "/network:auto"
+    "/gfx"
+  )
+  local size; size=$(work_area)
+  [[ $size =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] && [[ $full != true ]] && args+=("/size:$size")
+  # Letters typed with the current Linux layout reach Windows as the same
+  # characters, whatever layout Windows has; shortcuts (Ctrl/Alt/Win) and
+  # special keys still go as physical keys. The lookup uses X's built-in
+  # input method rather than a round trip to fcitx5 on every key press.
+  if [[ $unikbd == true ]]; then
+    args+=("/kbd:unicode:on")
+    env_prefix+=("XMODIFIERS=@im=none")
+  fi
+  [[ -n $user ]] && args+=("/u:$user")
+  [[ -n $domain ]] && args+=("/d:$domain")
+  [[ -n $password ]] && args+=("/p:$password")
+  [[ $full == true ]] && args+=("+f")
+  if [[ $clip == true ]]; then args+=("+clipboard"); else args+=("-clipboard"); fi
+  [[ $sound == true ]] && args+=("/sound" "/microphone")
+  [[ $home == true ]] && args+=("+home-drive")
+  if [[ $igncert == true ]]; then args+=("/cert:ignore"); else args+=("/cert:tofu"); fi
+
+  mkdir -p "$LOG_DIR"
+  local log="$LOG_DIR/$id.log"
+  local title=${name:-$host}
+
+  # Detach from the shell, so restarting the bar never drops a session.
+  # printf is a builtin: the password never shows up in any process' argv.
+  (
+    "${env_prefix[@]}" "$client" /args-from:stdin < <(printf '%s\n' "${args[@]}") >"$log" 2>&1 &
+    cpid=$!
+    [[ $full != true ]] && maximize_when_mapped "$cpid" &
+    wait "$cpid"
+    rc=$?
+    # FreeRDP exits below 128 for disconnects and logoffs (user- or
+    # server-initiated) and 128+ for connection failures.
+    if (( rc >= 128 )) || grep -qE 'ERRCONNECT_(LOGON_FAILURE|AUTHENTICATION_FAILED|PASSWORD|ACCOUNT)' "$log"; then
+      reason=$(explain_failure "$log" "$rc")
+      notify "Не удалось подключиться к $title" "$reason"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  disown
+  unset password args
+  echo "started"
+}
+
+cmd_store() {
+  local id=${1:-} label=${2:-}
+  valid_id "$id"
+  local password=""
+  IFS= read -r password || true
+  if [[ -z $password ]]; then
+    secret-tool clear service "$SERVICE" id "$id" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s' "$password" | secret-tool store --label="RDP Launcher: ${label:-$id}" service "$SERVICE" id "$id"
+}
+
+cmd_forget() {
+  local id=${1:-}
+  valid_id "$id"
+  secret-tool clear service "$SERVICE" id "$id" 2>/dev/null || true
+}
+
+cmd_has() {
+  local id=${1:-}
+  valid_id "$id"
+  secret-tool lookup service "$SERVICE" id "$id" >/dev/null 2>&1
+}
+
+cmd_saved() {
+  secret-tool search --all service "$SERVICE" 2>&1 \
+    | sed -nE 's/^attribute\.id = ([A-Za-z0-9_-]+)$/\1/p' | sort -u
+}
+
+case ${1:-} in
+  connect) shift; cmd_connect "$@" ;;
+  store)   shift; cmd_store "$@" ;;
+  forget)  shift; cmd_forget "$@" ;;
+  has)     shift; cmd_has "$@" ;;
+  saved)   cmd_saved ;;
+  *) die "usage: rdp-launcher connect|store|forget|has|saved" ;;
+esac
